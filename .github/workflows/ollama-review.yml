@@ -52,6 +52,7 @@ jobs:
     env:
       OLLAMA_MODELS: /home/runner/.ollama-models
       OUT: .go-pr-review/ci
+      PYTHONUNBUFFERED: "1"
     steps:
       - name: Check out code under review
         uses: actions/checkout@v4
@@ -77,13 +78,23 @@ jobs:
 
       - name: Install and start Ollama
         run: |
+          echo "runner: $(nproc) CPUs, $(free -g | awk '/Mem:/{print $2}') GB RAM"
+          start=$(date +%s)
           curl -fsSL https://ollama.com/install.sh | sh
+          echo "ollama installed in $(( $(date +%s) - start ))s: $(ollama --version 2>&1 | tail -n 1)"
           # the installer starts a system service; run our own server so models live in the cached folder
           sudo systemctl stop ollama 2>/dev/null || true
           mkdir -p "$OLLAMA_MODELS"
           nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
           for _ in $(seq 1 30); do curl -sf http://localhost:11434/api/version && break; sleep 1; done
-          ollama show "${{ inputs.model }}" > /dev/null 2>&1 || ollama pull "${{ inputs.model }}"
+          if ollama show "${{ inputs.model }}" > /dev/null 2>&1; then
+            echo "model ${{ inputs.model }} restored from cache"
+          else
+            echo "downloading ${{ inputs.model }} (not in cache yet)..."
+            start=$(date +%s)
+            ollama pull "${{ inputs.model }}" 2>&1 | tr '\r' '\n' | awk 'NR % 50 == 1'
+            echo "downloaded in $(( $(date +%s) - start ))s"
+          fi
 
       - name: Collect vet, test and code
         env:

@@ -10,7 +10,9 @@ window is ~4k tokens and Ollama silently drops the start of longer prompts.
 """
 import argparse
 import json
+import os
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -31,24 +33,118 @@ Given the findings and the go vet / go test results, write a numbered list of 3 
 Only use what is given. Output just the numbered list."""
 
 
-def chat(host, model, system, user, num_ctx, num_predict, timeout):
-    body = {
-        "model": model,
-        "stream": False,
-        "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": 0.2},
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-    }
+T0 = time.time()
+
+
+def log(msg):
+    """Progress line with time since start; unbuffered so it shows up live in the Actions log."""
+    m, sec = divmod(int(time.time() - T0), 60)
+    print(f"[{m:02d}:{sec:02d}] {msg}", file=sys.stderr, flush=True)
+
+
+class Rate:
+    """Prompt-reading speed from the previous call, to estimate how long the next one takes."""
+    tokens_per_sec = None
+
+
+def load_model(host, model):
+    log(f"loading {model} into memory...")
+    t = time.time()
+    req = urllib.request.Request(f"{host}/api/generate",
+                                 data=json.dumps({"model": model, "prompt": "", "keep_alive": "60m"}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            resp.read()
+    except Exception as e:
+        sys.exit(f"ERROR: could not load {model} from Ollama at {host}: {e} (is `ollama serve` running?)")
+    log(f"model loaded in {time.time() - t:.0f}s")
+
+
+def chat(host, model, system, user, num_ctx, num_predict, timeout, label="", est_tokens=0,
+         num_thread=None, heartbeat=20):
+    """Streaming chat call that logs what it is doing while the model works."""
+    opts = {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": 0.2}
+    if num_thread:
+        opts["num_thread"] = num_thread
+    body = {"model": model, "stream": True, "keep_alive": "60m", "options": opts,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     req = urllib.request.Request(f"{host}/api/chat", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    t0 = time.time()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        r = json.load(resp)
-    return {
-        "text": r["message"]["content"].strip(),
-        "prompt_tokens": r.get("prompt_eval_count"),
-        "output_tokens": r.get("eval_count"),
-        "seconds": round(time.time() - t0, 1),
+    state = {"phase": "reading", "start": time.time(), "first": None, "out": 0, "done": False}
+    eta = ""
+    if Rate.tokens_per_sec and est_tokens:
+        secs = est_tokens / Rate.tokens_per_sec
+        eta = f", about {secs / 60:.0f} min at the last measured speed" if secs >= 90 else \
+            f", about {secs:.0f}s at the last measured speed"
+    log(f"{label}: model is reading ~{est_tokens} tokens of input{eta}")
+
+    def beat():
+        while not state["done"]:
+            time.sleep(heartbeat)
+            if state["done"]:
+                break
+            el = time.time() - state["start"]
+            if state["phase"] == "reading":
+                log(f"{label}: still reading input ({el:.0f}s so far; Ollama reports no progress during this phase)")
+            else:
+                w = time.time() - state["first"]
+                log(f"{label}: writing, {state['out']} tokens so far ({state['out'] / max(w, 1):.1f} tok/s, "
+                    f"limit {num_predict})")
+
+    threading.Thread(target=beat, daemon=True).start()
+    text, line, final = [], "", {}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw in resp:
+                ev = json.loads(raw)
+                piece = ev.get("message", {}).get("content", "")
+                if piece:
+                    if state["first"] is None:
+                        state["first"], state["phase"] = time.time(), "writing"
+                        log(f"{label}: finished reading after {state['first'] - state['start']:.0f}s; "
+                            f"now writing the review:")
+                    state["out"] += 1
+                    text.append(piece)
+                    line += piece
+                    while "\n" in line:  # echo the review line by line as it is written
+                        done_line, line = line.split("\n", 1)
+                        if done_line.strip():
+                            print(f"    | {done_line}", file=sys.stderr, flush=True)
+                if ev.get("done"):
+                    final = ev
+    finally:
+        state["done"] = True
+    if line.strip():
+        print(f"    | {line}", file=sys.stderr, flush=True)
+
+    pe, pd = final.get("prompt_eval_count"), final.get("prompt_eval_duration")
+    if pe and pd:
+        Rate.tokens_per_sec = pe / (pd / 1e9)
+    r = {
+        "text": "".join(text).strip(),
+        "prompt_tokens": pe,
+        "output_tokens": final.get("eval_count"),
+        "seconds": round(time.time() - state["start"], 1),
+        "read_seconds": round(pd / 1e9, 1) if pd else None,
+        "write_seconds": round(final["eval_duration"] / 1e9, 1) if final.get("eval_duration") else None,
     }
+    log(f"{label}: done in {r['seconds']:.0f}s (read {pe} tokens in {r['read_seconds']}s, "
+        f"wrote {r['output_tokens']} tokens in {r['write_seconds']}s)")
+    return r
+
+
+IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def group(title):
+    if IN_ACTIONS:
+        print(f"::group::{title}", file=sys.stderr, flush=True)
+
+
+def endgroup():
+    if IN_ACTIONS:
+        print("::endgroup::", file=sys.stderr, flush=True)
 
 
 def fence(text, limit=6000):
@@ -68,8 +164,10 @@ def main():
     ap.add_argument("--model", default="qwen2.5-coder:7b")
     ap.add_argument("--host", default="http://localhost:11434")
     ap.add_argument("--num-ctx", type=int, default=16384)
-    ap.add_argument("--num-predict", type=int, default=1024)
+    ap.add_argument("--num-predict", type=int, default=768, help="max tokens the model writes per chunk")
+    ap.add_argument("--num-thread", type=int, default=os.cpu_count(), help="CPU threads for Ollama")
     ap.add_argument("--timeout", type=int, default=1800, help="seconds per model call")
+    ap.add_argument("--heartbeat", type=int, default=20, help="seconds between progress lines")
     ap.add_argument("--out", default="-", help="report path, or - for stdout")
     a = ap.parse_args()
 
@@ -80,26 +178,34 @@ def main():
     warnings = list(meta.get("warnings", []))
     stats, findings = [], []
 
-    for c in meta["chunks"]:
+    log(f"model {a.model}, num_ctx {a.num_ctx}, {a.num_thread} CPU threads, "
+        f"{len(meta['chunks'])} chunk(s) covering {len(meta['files'])} Go file(s)")
+    if meta["chunks"]:
+        load_model(a.host, a.model)
+    for i, c in enumerate(meta["chunks"], 1):
         est = c["chars"] // 3 + len(FINDINGS_PROMPT) // 3
         if est + a.num_predict > a.num_ctx:
             warnings.append(f"{c['file']} is ~{est} tokens; with num_ctx={a.num_ctx} the start may be cut off "
                             f"(lower --chunk-chars or raise --num-ctx)")
-        print(f"reviewing {c['file']} ({', '.join(c['packages'])}, ~{est} tokens)...", file=sys.stderr)
+        label = f"chunk {i}/{len(meta['chunks'])}"
+        group(f"{label}: {', '.join(c['files'])}")
+        log(f"{label}: packages {', '.join(c['packages'])}; files: {', '.join(c['files'])}")
         try:
-            r = chat(a.host, a.model, FINDINGS_PROMPT, (d / c["file"]).read_text(),
-                     a.num_ctx, a.num_predict, a.timeout)
+            r = chat(a.host, a.model, FINDINGS_PROMPT, (d / c["file"]).read_text(), a.num_ctx,
+                     a.num_predict, a.timeout, label=label, est_tokens=est, num_thread=a.num_thread,
+                     heartbeat=a.heartbeat)
         except Exception as e:  # keep going so one bad chunk doesn't lose the rest
             warnings.append(f"{c['file']}: model call failed: {e}")
             findings.append((c, f"_Model call failed: {e}_"))
+            log(f"{label}: FAILED: {e}")
+            endgroup()
             continue
         if r["prompt_tokens"] and r["prompt_tokens"] >= a.num_ctx - 16:
             warnings.append(f"{c['file']}: prompt filled the whole context window "
                             f"({r['prompt_tokens']} tokens); some code was probably not seen")
         stats.append((c["file"], r))
         findings.append((c, r["text"]))
-        print(f"  done in {r['seconds']}s, {r['prompt_tokens']} prompt / {r['output_tokens']} output tokens",
-              file=sys.stderr)
+        endgroup()
 
     # --- assemble ---------------------------------------------------------
     lines = ["## Diff Summary", ""]
@@ -136,7 +242,11 @@ def main():
         lines.append("No Go code changed; nothing for the model to act on.")
     else:
       try:
-        r = chat(a.host, a.model, NEXT_ACTION_PROMPT, summary_input, a.num_ctx, 512, a.timeout)
+        group("next action list")
+        r = chat(a.host, a.model, NEXT_ACTION_PROMPT, summary_input, a.num_ctx, 384, a.timeout,
+                 label="next action", est_tokens=len(summary_input) // 3, num_thread=a.num_thread,
+                 heartbeat=a.heartbeat)
+        endgroup()
         stats.append(("next-action", r))
         lines.append(r["text"])
       except Exception as e:
@@ -149,8 +259,10 @@ def main():
     total = sum(r["seconds"] for _, r in stats)
     lines += ["", "<details><summary>Run details</summary>", "",
               f"Model `{a.model}`, num_ctx {a.num_ctx}, {len(meta['chunks'])} chunk(s), {total:.0f}s of model time.", "",
-              "| call | prompt tokens | output tokens | seconds |", "|---|---|---|---|"]
-    lines += [f"| {name} | {r['prompt_tokens']} | {r['output_tokens']} | {r['seconds']} |" for name, r in stats]
+              "| call | prompt tokens | output tokens | reading (s) | writing (s) | total (s) |",
+              "|---|---|---|---|---|---|"]
+    lines += [f"| {name} | {r['prompt_tokens']} | {r['output_tokens']} | {r.get('read_seconds')} | "
+              f"{r.get('write_seconds')} | {r['seconds']} |" for name, r in stats]
     lines += ["", "</details>", ""]
 
     report = "\n".join(lines)
@@ -158,7 +270,7 @@ def main():
         sys.stdout.write(report)
     else:
         Path(a.out).write_text(report)
-        print(f"wrote {a.out}", file=sys.stderr)
+        log(f"wrote {a.out}")
 
 
 if __name__ == "__main__":

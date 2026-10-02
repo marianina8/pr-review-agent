@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 MAX_CHECK_OUTPUT = 20000  # chars of vet/test output kept (tail)
@@ -98,7 +99,10 @@ def build_chunks(files, diffs, budget, warnings):
 
 
 def check(cmd, out_path):
+    print(f"running: {' '.join(cmd)}", file=sys.stderr, flush=True)
+    t = time.time()
     rc, out = run(cmd)
+    print(f"  exit {rc} after {time.time() - t:.0f}s", file=sys.stderr, flush=True)
     if len(out) > MAX_CHECK_OUTPUT:
         out = "... [earlier output trimmed]\n" + out[-MAX_CHECK_OUTPUT:]
     out_path.write_text(out)
@@ -144,6 +148,7 @@ def main():
     meta["chunks"] = []
     for i, c in enumerate(chunks, 1):
         name = f"chunk-{i:02d}.md"
+        print(f"{name}: {', '.join(c['files'])} (~{len(c['text']) // 3} tokens)", file=sys.stderr, flush=True)
         header = f"Packages: {', '.join(c['packages'])}\n\n"
         (out / name).write_text(header + c["text"])
         meta["chunks"].append({"file": name, "packages": c["packages"], "files": c["files"],
