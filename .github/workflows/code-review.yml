@@ -43,6 +43,14 @@ on:
         description: "bedrock only"
         type: string
         default: us-west-2
+      label:
+        description: "Short name for this run (used in the artifact name and PR comment), e.g. sonnet-5-5"
+        type: string
+        default: ""
+      max_output_tokens:
+        description: "Max tokens the model may write per chunk"
+        type: number
+        default: 2048
       num_ctx:
         description: "Context window per model call, in tokens"
         type: number
@@ -70,6 +78,7 @@ jobs:
       id-token: write   # only used by provider=bedrock, to sign in to AWS without stored keys
     env:
       PROVIDER: ${{ inputs.provider }}
+      LABEL: ${{ inputs.label }}
       MODEL: ${{ inputs.model || (inputs.provider == 'bedrock' && 'qwen.qwen3-coder-30b-a3b-v1:0' || 'qwen2.5-coder:7b') }}
       OLLAMA_MODELS: /home/runner/.ollama-models
       OUT: .go-pr-review/ci
@@ -146,11 +155,12 @@ jobs:
       - name: Review (${{ inputs.provider }})
         env:
           NUM_CTX: ${{ inputs.num_ctx }}
+          MAX_OUT: ${{ inputs.max_output_tokens }}
           AWS_REGION: ${{ inputs.aws_region }}
         run: |
           python3 .pr-review-agent/ci/review.py --dir "$OUT" --provider "$PROVIDER" --model "$MODEL" \
-            --region "$AWS_REGION" --num-ctx "$NUM_CTX" --out "$OUT/review.md"
-          cat "$OUT/review.md" >> "$GITHUB_STEP_SUMMARY"
+            --region "$AWS_REGION" --num-ctx "$NUM_CTX" --num-predict "$MAX_OUT" --out "$OUT/review.md"
+          { echo "# ${LABEL:-Code review}: $PROVIDER \`$MODEL\`"; echo; cat "$OUT/review.md"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment on the pull request
         if: inputs.mode == 'pr' && inputs.comment && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -158,8 +168,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          marker='<!-- ai-code-review -->'
-          { echo "$marker"; echo "# Code review: $PROVIDER (\`$MODEL\`)"; echo; head -c 60000 "$OUT/review.md"; } > "$RUNNER_TEMP/comment.md"
+          marker="<!-- ai-code-review${LABEL:+-$LABEL} -->"
+          { echo "$marker"; echo "# Code review${LABEL:+ ($LABEL)}: $PROVIDER \`$MODEL\`"; echo; head -c 60000 "$OUT/review.md"; } > "$RUNNER_TEMP/comment.md"
           id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
                  --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n 1)
           if [ -n "$id" ]; then
@@ -172,7 +182,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: code-review
+          name: code-review${{ inputs.label && format('-{0}', inputs.label) || '' }}
           path: |
             .go-pr-review/ci/
             ${{ runner.temp }}/ollama.log

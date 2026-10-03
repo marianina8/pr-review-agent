@@ -1,18 +1,24 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  pr-review-agent - lets GitHub Actions in the listed repos call one Bedrock
-  model (no stored AWS keys). GitHub signs in with OIDC and assumes this role;
-  the role can only invoke the model below, nothing else.
+  pr-review-agent - lets GitHub Actions in the listed repos call a short list
+  of Bedrock models (no stored AWS keys). GitHub signs in with OIDC and assumes
+  this role; the role can only invoke the listed model families, nothing else.
 
 Parameters:
   AllowedSubjects:
     Type: CommaDelimitedList
     Default: "repo:marianina8/youtube-outliers:*"
     Description: GitHub OIDC subjects allowed to assume the role, e.g. repo:OWNER/REPO:* (comma-separated).
-  ModelId:
-    Type: String
-    Default: qwen.qwen3-coder-30b-a3b-v1:0
-    Description: The one Bedrock foundation model the role may invoke.
+  ModelPatterns:
+    Type: CommaDelimitedList
+    Default: "qwen.qwen3-coder-*,deepseek.*,anthropic.claude-sonnet-*,anthropic.claude-haiku-*"
+    Description: Foundation-model IDs (wildcards allowed) the role may invoke.
+  ProfilePatterns:
+    Type: CommaDelimitedList
+    Default: "*.anthropic.claude-sonnet-*,*.anthropic.claude-haiku-*"
+    Description: >
+      Inference profiles (us./global.) the role may invoke. Claude on Bedrock is called
+      through these profiles, which route to the foundation model in several regions.
   CreateOIDCProvider:
     Type: String
     AllowedValues: ["true", "false"]
@@ -55,14 +61,27 @@ Resources:
               StringLike:
                 token.actions.githubusercontent.com:sub: !Ref AllowedSubjects
       Policies:
-        - PolicyName: InvokeOneBedrockModel
+        - PolicyName: InvokeListedBedrockModels
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: BedrockInvokeOneModelOnly
+              # Foundation models in any region (profiles route across regions; global ones use an empty region).
+              - Sid: ListedFoundationModels
                 Effect: Allow
                 Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
-                Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}
+                Resource: !Split
+                  - ","
+                  - !Sub
+                    - "arn:aws:bedrock:*::foundation-model/${Inner}"
+                    - Inner: !Join [",arn:aws:bedrock:*::foundation-model/", !Ref ModelPatterns]
+              - Sid: ListedInferenceProfiles
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource: !Split
+                  - ","
+                  - !Sub
+                    - "arn:aws:bedrock:*:*:inference-profile/${Inner}"
+                    - Inner: !Join [",arn:aws:bedrock:*:*:inference-profile/", !Ref ProfilePatterns]
       Tags:
         - { Key: app, Value: pr-review-agent }
         - { Key: data, Value: demo }

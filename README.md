@@ -49,14 +49,33 @@ How it works:
 One-time setup (needs the AWS CLI and the `demos-admin` profile; override with `PROFILE=` / `REGION=`):
 
 ```bash
-make bedrock-smoke                 # one tiny call with your own login: checks the model is usable
-make bedrock-role                  # IAM role GitHub can assume; it may only invoke that one model
+make bedrock-smoke-all             # one tiny call per model with your own login: checks each is usable
+make bedrock-role                  # IAM role GitHub can assume; it may only invoke the listed model families
 gh variable set BEDROCK_REVIEW_ROLE_ARN -R OWNER/REPO --body "$(make -s bedrock-role-arn)"
+```
+
+The role allows Qwen3-Coder, DeepSeek, and Claude Sonnet and Haiku (Claude through its `us.`/`global.` inference profiles); change `ModelPatterns`/`ProfilePatterns` in `infra/github-bedrock-role.yaml` to allow others. `make bedrock-models` lists the IDs available in your region.
+
+### Comparing models
+
+Pass a `label` per call to keep runs apart (artifact `code-review-<label>`, its own PR comment). A matrix job runs several models on the same code in parallel; see `compare-models.yml` in youtube-outliers:
+
+```yaml
+jobs:
+  review:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: qwen3-coder-480b, model: qwen.qwen3-coder-480b-a35b-v1:0 }
+          - { label: claude-sonnet-5-5, model: global.anthropic.claude-sonnet-5-5 }
+    uses: marianina8/pr-review-agent/.github/workflows/code-review.yml@main
+    with: { mode: code, provider: bedrock, model: "${{ matrix.model }}", label: "${{ matrix.label }}", aws_role_arn: "${{ vars.BEDROCK_REVIEW_ROLE_ARN }}" }
 ```
 
 To allow more repos: `make bedrock-role SUBJECTS='repo:OWNER/a:*,repo:OWNER/b:*'`. The calling workflow must grant `id-token: write` (the example above does).
 
-Inputs (all optional): `mode` (`pr`|`code`), `target`, `provider` (`ollama`|`bedrock`), `model`, `aws_role_arn`, `aws_region` (us-west-2), `num_ctx` (16384), `chunk_chars` (30000), `comment` (true), `agent_ref` (main).
+Inputs (all optional): `mode` (`pr`|`code`), `target`, `provider` (`ollama`|`bedrock`), `model`, `label`, `max_output_tokens` (2048), `aws_role_arn`, `aws_region` (us-west-2), `num_ctx` (16384), `chunk_chars` (30000), `comment` (true), `agent_ref` (main).
 
 With Bedrock a review takes a minute or two. With Ollama on the standard runner expect roughly 5–10 minutes per chunk for a 7B model; the model download is cached between runs. The workflow uses `pull_request`, never `pull_request_target`, so code from forks runs without write access and gets no PR comment.
 
