@@ -1,0 +1,179 @@
+# Reusable workflow: review Go code with a model, then post the review.
+#
+# provider=ollama  (default) runs Ollama on the GitHub runner, e.g. qwen2.5-coder:7b.
+# provider=bedrock calls Amazon Bedrock (default model qwen.qwen3-coder-30b-a3b-v1:0)
+#                  through an AWS role GitHub signs in to with OIDC (infra/github-bedrock-role.yaml).
+#                  The calling workflow must grant `id-token: write`.
+#
+# Call it from another repo (see README.md):
+#   jobs:
+#     review:
+#       uses: marianina8/pr-review-agent/.github/workflows/code-review.yml@main
+#       with: { mode: pr }
+#
+# mode=pr   reviews only what the pull request changes and comments on the PR.
+# mode=code reviews every Go file under `target`; the review goes to the run summary.
+# Either way the full report is uploaded as the `code-review` artifact.
+name: AI code review (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "pr (changed files only) or code (everything under target)"
+        type: string
+        default: pr
+      target:
+        description: "File or folder to review"
+        type: string
+        default: "."
+      provider:
+        description: "ollama (on the runner) or bedrock (Amazon Bedrock)"
+        type: string
+        default: ollama
+      model:
+        description: "Empty = qwen2.5-coder:7b for ollama, qwen.qwen3-coder-30b-a3b-v1:0 for bedrock"
+        type: string
+        default: ""
+      aws_role_arn:
+        description: "bedrock only: role ARN from `make bedrock-role`"
+        type: string
+        default: ""
+      aws_region:
+        description: "bedrock only"
+        type: string
+        default: us-west-2
+      num_ctx:
+        description: "Context window per model call, in tokens"
+        type: number
+        default: 16384
+      chunk_chars:
+        description: "Max characters of code per model call (~3 chars per token)"
+        type: number
+        default: 30000
+      comment:
+        description: "Post or update a PR comment in pr mode"
+        type: boolean
+        default: true
+      agent_ref:
+        description: "Branch or tag of pr-review-agent to take the scripts from"
+        type: string
+        default: main
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write   # only used by provider=bedrock, to sign in to AWS without stored keys
+    env:
+      PROVIDER: ${{ inputs.provider }}
+      MODEL: ${{ inputs.model || (inputs.provider == 'bedrock' && 'qwen.qwen3-coder-30b-a3b-v1:0' || 'qwen2.5-coder:7b') }}
+      OLLAMA_MODELS: /home/runner/.ollama-models
+      OUT: .go-pr-review/ci
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out code under review
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out pr-review-agent scripts
+        uses: actions/checkout@v4
+        with:
+          repository: marianina8/pr-review-agent
+          ref: ${{ inputs.agent_ref }}
+          path: .pr-review-agent
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Restore model cache
+        if: inputs.provider == 'ollama'
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ollama-models
+          key: ollama-${{ runner.os }}-${{ env.MODEL }}
+
+      - name: Install and start Ollama
+        if: inputs.provider == 'ollama'
+        run: |
+          echo "runner: $(nproc) CPUs, $(free -g | awk '/Mem:/{print $2}') GB RAM"
+          start=$(date +%s)
+          curl -fsSL https://ollama.com/install.sh | sh
+          echo "ollama installed in $(( $(date +%s) - start ))s: $(ollama --version 2>&1 | tail -n 1)"
+          # the installer starts a system service; run our own server so models live in the cached folder
+          sudo systemctl stop ollama 2>/dev/null || true
+          mkdir -p "$OLLAMA_MODELS"
+          nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          for _ in $(seq 1 30); do curl -sf http://localhost:11434/api/version && break; sleep 1; done
+          if ollama show "$MODEL" > /dev/null 2>&1; then
+            echo "model $MODEL restored from cache"
+          else
+            echo "downloading $MODEL (not in cache yet)..."
+            start=$(date +%s)
+            ollama pull "$MODEL" 2>&1 | tr '\r' '\n' | awk 'NR % 50 == 1'
+            echo "downloaded in $(( $(date +%s) - start ))s"
+          fi
+
+      - name: Check Bedrock settings
+        if: inputs.provider == 'bedrock' && inputs.aws_role_arn == ''
+        run: |
+          echo "::error::provider=bedrock needs aws_role_arn (set the BEDROCK_REVIEW_ROLE_ARN repository variable; see pr-review-agent README)"
+          exit 1
+
+      - name: Sign in to AWS (OIDC)
+        if: inputs.provider == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: pr-review-${{ github.run_id }}
+
+      - name: Collect vet, test and code
+        env:
+          MODE: ${{ inputs.mode }}
+          TARGET: ${{ inputs.target }}
+          BASE: origin/${{ github.base_ref || github.event.repository.default_branch }}
+          CHUNK_CHARS: ${{ inputs.chunk_chars }}
+        run: |
+          python3 .pr-review-agent/ci/collect.py --mode "$MODE" --target "$TARGET" \
+            --base "$BASE" --out "$OUT" --chunk-chars "$CHUNK_CHARS"
+
+      - name: Review (${{ inputs.provider }})
+        env:
+          NUM_CTX: ${{ inputs.num_ctx }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          python3 .pr-review-agent/ci/review.py --dir "$OUT" --provider "$PROVIDER" --model "$MODEL" \
+            --region "$AWS_REGION" --num-ctx "$NUM_CTX" --out "$OUT/review.md"
+          cat "$OUT/review.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the pull request
+        if: inputs.mode == 'pr' && inputs.comment && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          marker='<!-- ai-code-review -->'
+          { echo "$marker"; echo "# Code review: $PROVIDER (\`$MODEL\`)"; echo; head -c 60000 "$OUT/review.md"; } > "$RUNNER_TEMP/comment.md"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                 --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F "body=@$RUNNER_TEMP/comment.md" > /dev/null
+          else
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/comment.md"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-review
+          path: |
+            .go-pr-review/ci/
+            ${{ runner.temp }}/ollama.log
+          if-no-files-found: ignore

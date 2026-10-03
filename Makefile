@@ -4,7 +4,9 @@ PROFILE ?= demos-admin
 REGION ?= us-west-2
 STACK := pr-review-agent-bedrock
 MODEL ?= qwen.qwen3-coder-30b-a3b-v1:0
-SUBJECTS ?= repo:marianina8/youtube-outliers:*
+# GitHub's OIDC subject for a repo; repos with immutable subjects use OWNER@ID/REPO@ID (see
+# gh api repos/OWNER/REPO/actions/oidc/customization/sub), so allow both forms.
+SUBJECTS ?= repo:marianina8/youtube-outliers:*,repo:marianina8@8147854/youtube-outliers@1382389609:*
 
 help:
 	@echo "make bedrock-smoke      one tiny Bedrock call with your own profile (checks model access)"
