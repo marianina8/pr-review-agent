@@ -85,24 +85,25 @@ jobs:
       PYTHONUNBUFFERED: "1"
     steps:
       - name: Check out code under review
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Check out pr-review-agent scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: marianina8/pr-review-agent
           ref: ${{ inputs.agent_ref }}
           path: .pr-review-agent
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache: false   # repos without go.sum (no dependencies) have nothing to cache
 
       - name: Restore model cache
         if: inputs.provider == 'ollama'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /home/runner/.ollama-models
           key: ollama-${{ runner.os }}-${{ env.MODEL }}
@@ -136,7 +137,7 @@ jobs:
 
       - name: Sign in to AWS (OIDC)
         if: inputs.provider == 'bedrock'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ inputs.aws_role_arn }}
           aws-region: ${{ inputs.aws_region }}
@@ -180,7 +181,7 @@ jobs:
 
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: code-review${{ inputs.label && format('-{0}', inputs.label) || '' }}
           path: |

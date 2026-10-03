@@ -18,10 +18,15 @@ help:
 	@echo "make bedrock-role-arn   print the role ARN to set as BEDROCK_REVIEW_ROLE_ARN"
 	@echo "Overrides: PROFILE=$(PROFILE) REGION=$(REGION) SUBJECTS='repo:OWNER/REPO:*,...'"
 
-# Creates the GitHub OIDC provider too, unless the account already has one.
+# Creates the GitHub OIDC provider too, unless another stack or tool already made one.
+# If this stack created it, keep it: passing false on an update would make CloudFormation delete it.
 bedrock-role:
-	@if aws iam list-open-id-connect-providers --profile $(PROFILE) --output text | grep -q token.actions.githubusercontent.com; then \
-		create=false; echo "GitHub OIDC provider already exists; reusing it"; else create=true; fi; \
+	@if aws cloudformation describe-stack-resource --stack-name $(STACK) --logical-resource-id GitHubOIDCProvider \
+			--profile $(PROFILE) --region $(REGION) > /dev/null 2>&1; then \
+		create=true; echo "GitHub OIDC provider is managed by this stack; keeping it"; \
+	elif aws iam list-open-id-connect-providers --profile $(PROFILE) --output text | grep -q token.actions.githubusercontent.com; then \
+		create=false; echo "GitHub OIDC provider already exists outside this stack; reusing it"; \
+	else create=true; fi; \
 	aws cloudformation deploy --template-file infra/github-bedrock-role.yaml --stack-name $(STACK) \
 		--capabilities CAPABILITY_NAMED_IAM --profile $(PROFILE) --region $(REGION) \
 		--tags app=pr-review-agent data=demo \
