@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  pr-review-agent - lets GitHub Actions in the listed repos call one Bedrock
+  model (no stored AWS keys). GitHub signs in with OIDC and assumes this role;
+  the role can only invoke the model below, nothing else.
+
+Parameters:
+  AllowedSubjects:
+    Type: CommaDelimitedList
+    Default: "repo:marianina8/youtube-outliers:*"
+    Description: GitHub OIDC subjects allowed to assume the role, e.g. repo:OWNER/REPO:* (comma-separated).
+  ModelId:
+    Type: String
+    Default: qwen.qwen3-coder-30b-a3b-v1:0
+    Description: The one Bedrock foundation model the role may invoke.
+  CreateOIDCProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: "false if this account already has the token.actions.githubusercontent.com OIDC provider."
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - { Key: app, Value: pr-review-agent }
+        - { Key: data, Value: demo }
+
+  ReviewRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: pr-review-agent-bedrock
+      Description: GitHub Actions Ollama/Bedrock review workflow - Bedrock invoke only.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Ref AllowedSubjects
+      Policies:
+        - PolicyName: InvokeOneBedrockModel
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockInvokeOneModelOnly
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ModelId}
+      Tags:
+        - { Key: app, Value: pr-review-agent }
+        - { Key: data, Value: demo }
+
+Outputs:
+  RoleArn:
+    Description: Set this as the BEDROCK_REVIEW_ROLE_ARN repository variable in each repo that runs the review.
+    Value: !GetAtt ReviewRole.Arn

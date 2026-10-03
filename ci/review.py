@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Review collected Go context with a local Ollama model and write a Markdown report.
+"""Review collected Go context with a model and write a Markdown report.
+
+Providers:
+  ollama   a local Ollama server (default), e.g. qwen2.5-coder:7b
+  bedrock  Amazon Bedrock through the AWS CLI's `converse` command, e.g.
+           qwen.qwen3-coder-30b-a3b-v1:0 (needs AWS credentials; no Python deps)
 
 The model only writes the code findings (one call per chunk) and the Next
 Action list (one short call at the end). The go vet / go test sections come
 straight from the tool output, so the model can't misreport them.
 
-Uses Ollama's /api/chat with an explicit num_ctx: the CLI's default context
+For Ollama it uses /api/chat with an explicit num_ctx: the CLI's default context
 window is ~4k tokens and Ollama silently drops the start of longer prompts.
 """
 import argparse
@@ -19,14 +24,28 @@ from pathlib import Path
 
 FINDINGS_PROMPT = """You are a senior Go code reviewer. You are given Go source files with numbered lines ("N| code") and, for a pull request, the diff of each changed file.
 
-Report only real problems you can point to in the code shown: bugs, wrong or missing error handling, resource leaks, concurrency problems, security problems (for example secrets ending up in logs or URLs), API misuse, and missing input validation.
+Go through the checklist below for the code shown. Under each heading, list the concrete problems you find, or write "- none found" if you checked and there are none.
+
+### Error handling
+Errors that are ignored or only logged, and what state the program is left in when something fails partway.
+### Secrets and sensitive data
+Where credentials or other sensitive values can end up.
+### Input validation
+Inputs (flags, config, parsed values) that are accepted but should not be.
+### External services
+How failures, limits and timeouts from network calls are handled.
+### Resources and concurrency
+Leaked files, bodies or goroutines; races; cancellation.
+### Tests
+Important behavior that has no test.
 
 Rules:
-- Cite each finding as `path:line`, using the line numbers shown.
-- Do not invent code, files or behavior that is not shown. No style nitpicks, no praise, no summary of what the code does.
-- For a pull request, focus on the changed lines, but also report anything the change breaks.
-- Output a Markdown bullet list, most severe first. Each bullet: **high|medium|low** — `path:line` — the problem — the fix.
-- If there are no real problems, output exactly: No issues found."""
+- Use exactly the six headings above, in that order.
+- Each problem is one bullet: `- **severity** — path:line — what is wrong — how to fix it`, where severity is one word: high, medium or low.
+  Example of the format (not from this code): `- **medium** — store/cache.go:42 — the error from f.Close() is ignored, so a failed flush is lost — return the error from Close.`
+- Cite line numbers exactly as shown. Only report what you can point to in the code shown; do not invent code, files or behavior.
+- No praise and no summary of what the code does.
+- For a pull request, focus on the changed lines, but also report anything the change breaks."""
 
 NEXT_ACTION_PROMPT = """You are a senior Go reviewer writing the last section of a review.
 Given the findings and the go vet / go test results, write a numbered list of 3 to 6 concrete actions, most important first.
@@ -134,6 +153,58 @@ def chat(host, model, system, user, num_ctx, num_predict, timeout, label="", est
     return r
 
 
+def bedrock_chat(model, region, system, user, max_tokens, timeout, label="", est_tokens=0, heartbeat=20):
+    """One Bedrock Converse call through the AWS CLI (preinstalled on GitHub runners)."""
+    import subprocess
+    import tempfile
+    log(f"{label}: sending ~{est_tokens} tokens to Bedrock ({model}, {region})")
+    with tempfile.TemporaryDirectory() as tmp:
+        files = {
+            "system": [{"text": system}],
+            "messages": [{"role": "user", "content": [{"text": user}]}],
+            "config": {"maxTokens": max_tokens, "temperature": 0.2},
+        }
+        for name, val in files.items():
+            Path(tmp, f"{name}.json").write_text(json.dumps(val))
+        cmd = ["aws", "bedrock-runtime", "converse", "--model-id", model, "--region", region,
+               "--system", f"file://{tmp}/system.json", "--messages", f"file://{tmp}/messages.json",
+               "--inference-config", f"file://{tmp}/config.json",
+               "--cli-read-timeout", str(timeout), "--output", "json"]
+        state = {"done": False, "start": time.time()}
+
+        def beat():
+            while not state["done"]:
+                time.sleep(heartbeat)
+                if not state["done"]:
+                    log(f"{label}: waiting for Bedrock ({time.time() - state['start']:.0f}s so far)")
+
+        threading.Thread(target=beat, daemon=True).start()
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 60)
+        finally:
+            state["done"] = True
+    if p.returncode != 0:
+        raise RuntimeError(f"aws bedrock-runtime converse failed: {p.stderr.strip()[-800:]}")
+    r = json.loads(p.stdout)
+    text = "".join(c.get("text", "") for c in r["output"]["message"]["content"]).strip()
+    for line in text.splitlines():
+        if line.strip():
+            print(f"    | {line}", file=sys.stderr, flush=True)
+    usage = r.get("usage", {})
+    out = {
+        "text": text,
+        "prompt_tokens": usage.get("inputTokens"),
+        "output_tokens": usage.get("outputTokens"),
+        "seconds": round(time.time() - state["start"], 1),
+        "read_seconds": None,
+        "write_seconds": None,
+        "stop_reason": r.get("stopReason"),
+    }
+    log(f"{label}: done in {out['seconds']:.0f}s ({out['prompt_tokens']} tokens in, "
+        f"{out['output_tokens']} out, stop reason {out['stop_reason']})")
+    return out
+
+
 IN_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
@@ -161,15 +232,28 @@ def status(rc):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", default=".go-pr-review/ci", help="output folder of collect.py")
-    ap.add_argument("--model", default="qwen2.5-coder:7b")
+    ap.add_argument("--provider", choices=["ollama", "bedrock"], default="ollama")
+    ap.add_argument("--model", default=None,
+                    help="default: qwen2.5-coder:7b (ollama) or qwen.qwen3-coder-30b-a3b-v1:0 (bedrock)")
+    ap.add_argument("--region", default=os.environ.get("AWS_REGION", "us-west-2"), help="Bedrock region")
     ap.add_argument("--host", default="http://localhost:11434")
     ap.add_argument("--num-ctx", type=int, default=16384)
-    ap.add_argument("--num-predict", type=int, default=768, help="max tokens the model writes per chunk")
+    ap.add_argument("--num-predict", type=int, default=1024, help="max tokens the model writes per chunk")
     ap.add_argument("--num-thread", type=int, default=os.cpu_count(), help="CPU threads for Ollama")
     ap.add_argument("--timeout", type=int, default=1800, help="seconds per model call")
     ap.add_argument("--heartbeat", type=int, default=20, help="seconds between progress lines")
     ap.add_argument("--out", default="-", help="report path, or - for stdout")
     a = ap.parse_args()
+    if not a.model:
+        a.model = "qwen.qwen3-coder-30b-a3b-v1:0" if a.provider == "bedrock" else "qwen2.5-coder:7b"
+    ollama = a.provider == "ollama"
+
+    def call(system, user, max_tokens, label, est):
+        if ollama:
+            return chat(a.host, a.model, system, user, a.num_ctx, max_tokens, a.timeout, label=label,
+                        est_tokens=est, num_thread=a.num_thread, heartbeat=a.heartbeat)
+        return bedrock_chat(a.model, a.region, system, user, max_tokens, a.timeout, label=label,
+                            est_tokens=est, heartbeat=a.heartbeat)
 
     d = Path(a.dir)
     meta = json.loads((d / "meta.json").read_text())
@@ -178,31 +262,32 @@ def main():
     warnings = list(meta.get("warnings", []))
     stats, findings = [], []
 
-    log(f"model {a.model}, num_ctx {a.num_ctx}, {a.num_thread} CPU threads, "
+    where = f"num_ctx {a.num_ctx}, {a.num_thread} CPU threads" if ollama else f"Bedrock {a.region}"
+    log(f"{a.provider}: model {a.model}, {where}, "
         f"{len(meta['chunks'])} chunk(s) covering {len(meta['files'])} Go file(s)")
-    if meta["chunks"]:
+    if meta["chunks"] and ollama:
         load_model(a.host, a.model)
     for i, c in enumerate(meta["chunks"], 1):
         est = c["chars"] // 3 + len(FINDINGS_PROMPT) // 3
-        if est + a.num_predict > a.num_ctx:
+        if ollama and est + a.num_predict > a.num_ctx:
             warnings.append(f"{c['file']} is ~{est} tokens; with num_ctx={a.num_ctx} the start may be cut off "
                             f"(lower --chunk-chars or raise --num-ctx)")
         label = f"chunk {i}/{len(meta['chunks'])}"
         group(f"{label}: {', '.join(c['files'])}")
         log(f"{label}: packages {', '.join(c['packages'])}; files: {', '.join(c['files'])}")
         try:
-            r = chat(a.host, a.model, FINDINGS_PROMPT, (d / c["file"]).read_text(), a.num_ctx,
-                     a.num_predict, a.timeout, label=label, est_tokens=est, num_thread=a.num_thread,
-                     heartbeat=a.heartbeat)
+            r = call(FINDINGS_PROMPT, (d / c["file"]).read_text(), a.num_predict, label, est)
         except Exception as e:  # keep going so one bad chunk doesn't lose the rest
             warnings.append(f"{c['file']}: model call failed: {e}")
             findings.append((c, f"_Model call failed: {e}_"))
             log(f"{label}: FAILED: {e}")
             endgroup()
             continue
-        if r["prompt_tokens"] and r["prompt_tokens"] >= a.num_ctx - 16:
+        if ollama and r["prompt_tokens"] and r["prompt_tokens"] >= a.num_ctx - 16:
             warnings.append(f"{c['file']}: prompt filled the whole context window "
                             f"({r['prompt_tokens']} tokens); some code was probably not seen")
+        if r.get("output_tokens") and r["output_tokens"] >= a.num_predict:
+            warnings.append(f"{c['file']}: the review hit the {a.num_predict}-token output limit and was cut off")
         stats.append((c["file"], r))
         findings.append((c, r["text"]))
         endgroup()
@@ -243,9 +328,7 @@ def main():
     else:
       try:
         group("next action list")
-        r = chat(a.host, a.model, NEXT_ACTION_PROMPT, summary_input, a.num_ctx, 384, a.timeout,
-                 label="next action", est_tokens=len(summary_input) // 3, num_thread=a.num_thread,
-                 heartbeat=a.heartbeat)
+        r = call(NEXT_ACTION_PROMPT, summary_input, 384, "next action", len(summary_input) // 3)
         endgroup()
         stats.append(("next-action", r))
         lines.append(r["text"])
@@ -258,11 +341,13 @@ def main():
 
     total = sum(r["seconds"] for _, r in stats)
     lines += ["", "<details><summary>Run details</summary>", "",
-              f"Model `{a.model}`, num_ctx {a.num_ctx}, {len(meta['chunks'])} chunk(s), {total:.0f}s of model time.", "",
+              f"Provider {a.provider}, model `{a.model}`" + (f", num_ctx {a.num_ctx}" if ollama else f", region {a.region}")
+              + f", {len(meta['chunks'])} chunk(s), {total:.0f}s of model time.", "",
               "| call | prompt tokens | output tokens | reading (s) | writing (s) | total (s) |",
               "|---|---|---|---|---|---|"]
-    lines += [f"| {name} | {r['prompt_tokens']} | {r['output_tokens']} | {r.get('read_seconds')} | "
-              f"{r.get('write_seconds')} | {r['seconds']} |" for name, r in stats]
+    dash = lambda v: "—" if v is None else v  # noqa: E731  (Bedrock doesn't split reading/writing time)
+    lines += [f"| {name} | {r['prompt_tokens']} | {r['output_tokens']} | {dash(r.get('read_seconds'))} | "
+              f"{dash(r.get('write_seconds'))} | {r['seconds']} |" for name, r in stats]
     lines += ["", "</details>", ""]
 
     report = "\n".join(lines)
