@@ -1,38 +1,45 @@
-# Reusable workflow: review Go code with a model, then post the review.
+# Reusable workflow: build the Go review agent from this repo and run it on the calling repo.
 #
-# provider=ollama  (default) runs Ollama on the GitHub runner, e.g. qwen2.5-coder:7b.
-# provider=bedrock calls Amazon Bedrock (default model qwen.qwen3-coder-30b-a3b-v1:0)
-#                  through an AWS role GitHub signs in to with OIDC (infra/github-bedrock-role.yaml).
-#                  The calling workflow must grant `id-token: write`.
+# provider=anthropic  Claude through the Anthropic API (needs the ANTHROPIC_API_KEY secret).
+# provider=bedrock    a model on Amazon Bedrock (Qwen, DeepSeek, Claude Haiku, ...), through an
+#                     AWS role GitHub signs in to with OIDC (infra/github-bedrock-role.yaml).
+#                     The calling workflow must grant `id-token: write`.
+# provider=ollama     Ollama running on the GitHub runner itself (slow: CPU only).
 #
-# Call it from another repo (see README.md):
-#   jobs:
-#     review:
-#       uses: marianina8/pr-review-agent/.github/workflows/code-review.yml@main
-#       with: { mode: pr }
-#
-# mode=pr   reviews only what the pull request changes and comments on the PR.
-# mode=code reviews every Go file under `target`; the review goes to the run summary.
-# Either way the full report is uploaded as the `code-review` artifact.
+# mode=pr   reviews what the pull request changes and comments on the PR.
+# mode=code reviews everything under `target`; the review goes to the run's summary page.
+# Either way the review, the agent's log and its stats are uploaded as an artifact.
 name: AI code review (reusable)
 
 on:
   workflow_call:
     inputs:
       mode:
-        description: "pr (changed files only) or code (everything under target)"
+        description: "pr (the pull request's changes) or code (everything under target)"
         type: string
         default: pr
       target:
-        description: "File or folder to review"
+        description: "code mode: file or folder to review"
         type: string
         default: "."
       provider:
-        description: "ollama (on the runner), bedrock (Amazon Bedrock) or anthropic (Anthropic API; needs the ANTHROPIC_API_KEY secret)"
+        description: "anthropic, bedrock or ollama"
         type: string
-        default: ollama
+        default: anthropic
       model:
-        description: "Empty = qwen2.5-coder:7b (ollama), qwen.qwen3-coder-30b-a3b-v1:0 (bedrock), claude-sonnet-5-5 (anthropic)"
+        description: "Empty = claude-sonnet-5-5 (anthropic), qwen.qwen3-coder-480b-a35b-v1:0 (bedrock), qwen2.5-coder:7b (ollama)"
+        type: string
+        default: ""
+      max_steps:
+        description: "Max model calls the agent may make"
+        type: number
+        default: 20
+      max_output_tokens:
+        description: "Max tokens the model may write per call"
+        type: number
+        default: 4096
+      label:
+        description: "Short name for this run (artifact name and PR comment), e.g. claude-sonnet-5-5"
         type: string
         default: ""
       aws_role_arn:
@@ -43,36 +50,16 @@ on:
         description: "bedrock only"
         type: string
         default: us-west-2
-      style:
-        description: "single (one call per chunk) or agent (the model may read files and run go commands first; bedrock only)"
-        type: string
-        default: single
-      max_steps:
-        description: "agent style: max actions per chunk"
-        type: number
-        default: 20
-      label:
-        description: "Short name for this run (used in the artifact name and PR comment), e.g. sonnet-5-5"
-        type: string
-        default: ""
-      max_output_tokens:
-        description: "Max tokens the model may write per chunk"
-        type: number
-        default: 2048
       num_ctx:
-        description: "Context window per model call, in tokens"
+        description: "ollama only: context window in tokens"
         type: number
-        default: 16384
-      chunk_chars:
-        description: "Max characters of code per model call (~3 chars per token)"
-        type: number
-        default: 30000
+        default: 32768
       comment:
         description: "Post or update a PR comment in pr mode"
         type: boolean
         default: true
       agent_ref:
-        description: "Branch or tag of pr-review-agent to take the scripts from"
+        description: "Branch or tag of pr-review-agent to build the agent from"
         type: string
         default: main
     secrets:
@@ -91,27 +78,36 @@ jobs:
     env:
       PROVIDER: ${{ inputs.provider }}
       LABEL: ${{ inputs.label }}
-      MODEL: ${{ inputs.model || (inputs.provider == 'bedrock' && 'qwen.qwen3-coder-30b-a3b-v1:0') || (inputs.provider == 'anthropic' && 'claude-sonnet-5-5') || 'qwen2.5-coder:7b' }}
+      MODEL: ${{ inputs.model || (inputs.provider == 'bedrock' && 'qwen.qwen3-coder-480b-a35b-v1:0') || (inputs.provider == 'ollama' && 'qwen2.5-coder:7b') || 'claude-sonnet-5-5' }}
       OLLAMA_MODELS: /home/runner/.ollama-models
       OUT: .go-pr-review/ci
-      PYTHONUNBUFFERED: "1"
     steps:
       - name: Check out code under review
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false   # keep the GitHub token out of .git/config, where scratch tests could read it
 
-      - name: Check out pr-review-agent scripts
+      - name: Check out pr-review-agent
         uses: actions/checkout@v7
         with:
           repository: marianina8/pr-review-agent
           ref: ${{ inputs.agent_ref }}
           path: .pr-review-agent
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
-          cache: false   # repos without go.sum (no dependencies) have nothing to cache
+          go-version-file: go.mod   # the code under review decides the Go version
+          cache: false
+
+      - name: Build the agent
+        run: |
+          (cd .pr-review-agent && go build -o "$RUNNER_TEMP/pr-review-agent" .)
+          rm -rf .pr-review-agent   # it must not be part of the code under review
+          # The agent runs go commands offline (GOPROXY=off), so fetch dependencies now.
+          if [ -f go.sum ]; then go mod download; fi
+          mkdir -p "$OUT"
 
       - name: Restore model cache
         if: inputs.provider == 'ollama'
@@ -124,9 +120,7 @@ jobs:
         if: inputs.provider == 'ollama'
         run: |
           echo "runner: $(nproc) CPUs, $(free -g | awk '/Mem:/{print $2}') GB RAM"
-          start=$(date +%s)
           curl -fsSL https://ollama.com/install.sh | sh
-          echo "ollama installed in $(( $(date +%s) - start ))s: $(ollama --version 2>&1 | tail -n 1)"
           # the installer starts a system service; run our own server so models live in the cached folder
           sudo systemctl stop ollama 2>/dev/null || true
           mkdir -p "$OLLAMA_MODELS"
@@ -135,25 +129,21 @@ jobs:
           if ollama show "$MODEL" > /dev/null 2>&1; then
             echo "model $MODEL restored from cache"
           else
-            echo "downloading $MODEL (not in cache yet)..."
-            start=$(date +%s)
+            echo "downloading $MODEL..."
             ollama pull "$MODEL" 2>&1 | tr '\r' '\n' | awk 'NR % 50 == 1'
-            echo "downloaded in $(( $(date +%s) - start ))s"
           fi
 
-      - name: Check Bedrock settings
-        if: inputs.provider == 'bedrock' && inputs.aws_role_arn == ''
-        run: |
-          echo "::error::provider=bedrock needs aws_role_arn (set the BEDROCK_REVIEW_ROLE_ARN repository variable; see pr-review-agent README)"
-          exit 1
-
-      - name: Check Anthropic settings
-        if: inputs.provider == 'anthropic'
+      - name: Check settings
         env:
           HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          ROLE: ${{ inputs.aws_role_arn }}
         run: |
-          if [ "$HAS_KEY" != "true" ]; then
+          if [ "$PROVIDER" = anthropic ] && [ "$HAS_KEY" != true ]; then
             echo "::error::provider=anthropic needs the ANTHROPIC_API_KEY secret (gh secret set ANTHROPIC_API_KEY -R OWNER/REPO) passed to this workflow"
+            exit 1
+          fi
+          if [ "$PROVIDER" = bedrock ] && [ -z "$ROLE" ]; then
+            echo "::error::provider=bedrock needs aws_role_arn (set the BEDROCK_REVIEW_ROLE_ARN repository variable; see the pr-review-agent README)"
             exit 1
           fi
 
@@ -165,38 +155,56 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
           role-session-name: pr-review-${{ github.run_id }}
 
-      - name: Collect vet, test and code
+      - name: Review (${{ inputs.provider }} ${{ inputs.model }})
         env:
           MODE: ${{ inputs.mode }}
           TARGET: ${{ inputs.target }}
           BASE: origin/${{ github.base_ref || github.event.repository.default_branch }}
-          CHUNK_CHARS: ${{ inputs.chunk_chars }}
-        run: |
-          python3 .pr-review-agent/ci/collect.py --mode "$MODE" --target "$TARGET" \
-            --base "$BASE" --out "$OUT" --chunk-chars "$CHUNK_CHARS"
-
-      - name: Review (${{ inputs.provider }}, ${{ inputs.style }})
-        env:
-          NUM_CTX: ${{ inputs.num_ctx }}
-          MAX_OUT: ${{ inputs.max_output_tokens }}
-          STYLE: ${{ inputs.style }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MAX_STEPS: ${{ inputs.max_steps }}
+          MAX_TOKENS: ${{ inputs.max_output_tokens }}
+          NUM_CTX: ${{ inputs.num_ctx }}
           AWS_REGION: ${{ inputs.aws_region }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          python3 .pr-review-agent/ci/review.py --dir "$OUT" --provider "$PROVIDER" --model "$MODEL" \
-            --region "$AWS_REGION" --num-ctx "$NUM_CTX" --num-predict "$MAX_OUT" \
-            --style "$STYLE" --max-steps "$MAX_STEPS" --repo . --out "$OUT/review.md"
-          { echo "# ${LABEL:-Code review}: $PROVIDER \`$MODEL\` ($STYLE)"; echo; cat "$OUT/review.md"; } >> "$GITHUB_STEP_SUMMARY"
+          case "$PROVIDER" in anthropic) agent_model=claude ;; *) agent_model="$PROVIDER" ;; esac
+          set +e
+          "$RUNNER_TEMP/pr-review-agent" --model "$agent_model" --model-name "$MODEL" \
+            --mode "$MODE" --target "$TARGET" --base "$BASE" \
+            --max-steps "$MAX_STEPS" --max-tokens "$MAX_TOKENS" \
+            --region "$AWS_REGION" --ollama-context "$NUM_CTX" \
+            --stats "$OUT/stats.json" \
+            2>&1 > "$OUT/review.md" | tee "$OUT/agent-log.txt"   # review to a file, progress to the log
+          status=${PIPESTATUS[0]}
+          set -e
+          [ -s "$OUT/review.md" ] || echo "_The agent did not finish a review (exit code $status); see the log below._" > "$OUT/review.md"
+          {
+            echo "# ${LABEL:-Code review}: $PROVIDER \`$MODEL\`"
+            echo
+            cat "$OUT/review.md"
+            echo
+            echo "## Run details"
+            echo
+            jq -r '"| Steps | Tool calls | Input tokens | Output tokens | Seconds |\n|---|---|---|---|---|\n| \(.steps) | \(.tool_calls) | \(.usage.input_tokens) | \(.usage.output_tokens) | \(.seconds) |"' "$OUT/stats.json" 2>/dev/null || echo "(no stats)"
+            echo
+            echo "<details><summary>What the agent did</summary>"
+            echo
+            echo '```text'
+            head -c 60000 "$OUT/agent-log.txt"
+            echo '```'
+            echo "</details>"
+          } > "$OUT/report.md"
+          cat "$OUT/report.md" >> "$GITHUB_STEP_SUMMARY"
+          exit $status
 
       - name: Comment on the pull request
-        if: inputs.mode == 'pr' && inputs.comment && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: always() && inputs.mode == 'pr' && inputs.comment && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
         run: |
+          [ -f "$OUT/report.md" ] || exit 0
           marker="<!-- ai-code-review${LABEL:+-$LABEL} -->"
-          { echo "$marker"; echo "# Code review${LABEL:+ ($LABEL)}: $PROVIDER \`$MODEL\`"; echo; head -c 60000 "$OUT/review.md"; } > "$RUNNER_TEMP/comment.md"
+          { echo "$marker"; head -c 60000 "$OUT/report.md"; } > "$RUNNER_TEMP/comment.md"
           id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
                  --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n 1)
           if [ -n "$id" ]; then

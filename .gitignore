@@ -1,2 +1,3 @@
 .DS_Store
 .go-pr-review/
+/pr-review-agent

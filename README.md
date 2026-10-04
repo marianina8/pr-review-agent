@@ -1,14 +1,56 @@
 # pr-review-agent
 
-Go code review in three forms that share the same checks (`go vet`, `go test`, the diff and the code):
+A Go code review agent, written in Go. It gives a model a few tools (read files, grep, `git diff`, `go vet`, `go test`, and throwaway scratch tests), lets it investigate the repository, and prints a review.
 
-- **Claude Code skill** — `.claude/skills/go-pr-provider`, run as `/go-pr-provider provider=claude|ollama ...`.
-- **Agent definition** — `.github/agents/go-pr-check.agent.md`.
-- **GitHub Actions** — a reusable workflow that reviews with either an Ollama model on the GitHub runner or a model on Amazon Bedrock, so nothing runs on your machine.
+The same binary runs on your machine and in GitHub Actions, with one of three model APIs behind the `--model` flag:
 
-## GitHub Actions: AI code review
+| `--model` | Talks to | Default `--model-name` | Needs |
+|---|---|---|---|
+| `claude` | Anthropic API | `claude-sonnet-5-5` | `ANTHROPIC_API_KEY` |
+| `bedrock` | Amazon Bedrock (Converse) | `qwen.qwen3-coder-480b-a35b-v1:0` | AWS credentials (profile, env, or the GitHub OIDC role) |
+| `ollama` | Ollama (`OLLAMA_HOST`, default localhost) | `qwen2.5-coder:7b` | a model that supports tool calling |
 
-Add this file to any Go repo as `.github/workflows/code-review.yml`:
+## Run it
+
+```bash
+go install github.com/marianina8/pr-review-agent@latest
+
+cd path/to/your/go/repo
+pr-review-agent --model claude                                   # review everything under .
+pr-review-agent --model ollama --target ./internal               # one folder, local model
+pr-review-agent --model bedrock --model-name deepseek.v3.2       # any Bedrock model with tool use
+pr-review-agent --model claude --mode pr --base origin/main      # only what this branch changes
+```
+
+The review goes to stdout and the progress (each tool call and the start of its result) goes to stderr, so `> review.md` keeps just the review. `--stats stats.json` also writes steps, tool calls, tokens and time.
+
+Other flags: `--max-steps` (20), `--max-tokens` (4096 per call), `--max-output` (20000 bytes per tool result), `--tool-timeout` (2m), `--region` (bedrock), `--ollama-context` (32768; Ollama's own default is small and silently drops the start of long conversations).
+
+## How it's built
+
+| File | What it does |
+|---|---|
+| `main.go` | flags, picks the model, writes the first message |
+| `agent.go` | the loop: ask the model, run the tools it asks for, send results back, stop when it answers |
+| `tools.go` | the tools and their guardrails |
+| `model.go` | the `Model` interface and the plain message types every model uses |
+| `claude.go`, `bedrock.go`, `ollama.go` | translate those types to and from each API |
+| `guidelines.md` | the reviewer's rules and output format, embedded in the binary |
+
+To change what the reviewer looks for or how it writes, edit `guidelines.md` and rebuild.
+
+## Guardrails
+
+- Every tool is read-only except `write_scratch_test`, which may only create new `zz_review_*_test.go` files. They are deleted when the review ends.
+- No shell. Each tool runs one fixed `git` or `go` command with its arguments passed as a list.
+- Paths must stay inside the repository (`..`, absolute paths and symlinks out are refused).
+- `go` and `git` run with a stripped-down environment (no API keys or cloud credentials) and `GOPROXY=off`, under a timeout.
+- Large tool output is trimmed before the model sees it.
+- Limit: a scratch test is real Go code. It runs as your user and can reach the network, so only review code you trust. The GitHub workflow checks out with `persist-credentials: false` so the token isn't on disk.
+
+## GitHub Actions
+
+`.github/workflows/code-review.yml` is a reusable workflow that builds this agent and runs it on the calling repo. Add this to any Go repo as `.github/workflows/code-review.yml`:
 
 ```yaml
 name: AI code review
@@ -16,8 +58,6 @@ on:
   pull_request:
     paths: ["**.go", "go.mod", "go.sum"]
   workflow_dispatch:
-    inputs:
-      target: { description: "File or folder to review", default: "." }
 permissions:
   contents: read
   pull-requests: write
@@ -27,26 +67,22 @@ jobs:
     uses: marianina8/pr-review-agent/.github/workflows/code-review.yml@main
     with:
       mode: ${{ github.event_name == 'pull_request' && 'pr' || 'code' }}
-      target: ${{ inputs.target || '.' }}
-      provider: bedrock    # or ollama
-      aws_role_arn: ${{ vars.BEDROCK_REVIEW_ROLE_ARN }}
+      provider: anthropic  # or bedrock, or ollama (runs on the GitHub runner; slow)
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-- **On a pull request** it reviews only the changed Go files (their diff plus the full file) and posts one comment on the PR, updated on each push.
-- **From the Actions tab** ("Run workflow") it reviews every Go file under `target`. The review appears on the run's summary page.
-- Both upload the full report and the raw inputs as the `code-review` artifact.
+- **On a pull request** it reviews the changes and posts one comment, updated on each push.
+- **From the Actions tab** it reviews everything under `target`; the review is on the run's summary page.
+- Both upload the review, the agent's log and its stats as the `code-review` artifact.
 
-How it works:
+Inputs (all optional): `mode` (`pr`|`code`), `target`, `provider` (`anthropic`|`bedrock`|`ollama`), `model`, `max_steps` (20), `max_output_tokens` (4096), `label`, `aws_role_arn`, `aws_region` (us-west-2), `num_ctx` (ollama, 32768), `comment` (true), `agent_ref` (main).
 
-1. `ci/collect.py` runs `go vet` and `go test`, then splits the code into chunks of whole packages that fit the model's context window, with numbered lines so findings cite `path:line`.
-2. `ci/review.py` sends each chunk to the model (Bedrock's Converse API, or Ollama's API with an explicit `num_ctx`, since the CLI default of ~4k tokens silently cuts off long prompts), then makes one more call for the Next Action list. The `go vet` and `go test` sections come straight from the tool output, not the model.
-3. The report warns when a chunk may not have fit and lists tokens and seconds per call.
+The workflow uses `pull_request`, never `pull_request_target`, so code from forks runs without secrets and gets no PR comment.
 
-### Bedrock instead of Ollama
+### Bedrock setup
 
-`provider: bedrock` sends the same chunks and the same instructions to Amazon Bedrock (default model `qwen.qwen3-coder-30b-a3b-v1:0`, an open-weight Qwen model hosted by AWS). GitHub signs in to AWS with OIDC, so no AWS keys are stored anywhere.
-
-One-time setup (needs the AWS CLI and the `demos-admin` profile; override with `PROFILE=` / `REGION=`):
+GitHub signs in to AWS with OIDC, so no AWS keys are stored. One-time setup (needs the AWS CLI and the `demos-admin` profile; override with `PROFILE=` / `REGION=`):
 
 ```bash
 make bedrock-smoke-all             # one tiny call per model with your own login: checks each is usable
@@ -54,34 +90,13 @@ make bedrock-role                  # IAM role GitHub can assume; it may only inv
 gh variable set BEDROCK_REVIEW_ROLE_ARN -R OWNER/REPO --body "$(make -s bedrock-role-arn)"
 ```
 
-The role allows Qwen3-Coder, DeepSeek, and Claude Sonnet and Haiku (Claude through its `us.`/`global.` inference profiles); change `ModelPatterns`/`ProfilePatterns` in `infra/github-bedrock-role.yaml` to allow others. `make bedrock-models` lists the IDs available in your region.
+The role allows Qwen3-Coder, DeepSeek, and Claude Sonnet, Haiku and Opus; change `ModelPatterns`/`ProfilePatterns` in `infra/github-bedrock-role.yaml` to allow others. To allow more repos: `make bedrock-role SUBJECTS='repo:OWNER/a:*,repo:OWNER/b:*'`.
 
 ### Comparing models
 
-Pass a `label` per call to keep runs apart (artifact `code-review-<label>`, its own PR comment). A matrix job runs several models on the same code in parallel; see `compare-models.yml` in youtube-outliers:
+Pass a `label` per call to keep runs apart. youtube-outliers' `compare-models.yml` runs the agent with Qwen3-Coder 480B, DeepSeek V3.2, Claude Haiku 4.5 (Bedrock) and Claude Sonnet 5.5 (Anthropic API) in parallel on the same code.
 
-```yaml
-jobs:
-  review:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { label: qwen3-coder-480b, model: qwen.qwen3-coder-480b-a35b-v1:0 }
-          - { label: claude-sonnet-5-5, model: global.anthropic.claude-sonnet-5-5 }
-    uses: marianina8/pr-review-agent/.github/workflows/code-review.yml@main
-    with: { mode: code, provider: bedrock, model: "${{ matrix.model }}", label: "${{ matrix.label }}", aws_role_arn: "${{ vars.BEDROCK_REVIEW_ROLE_ARN }}" }
-```
+## Other forms
 
-To allow more repos: `make bedrock-role SUBJECTS='repo:OWNER/a:*,repo:OWNER/b:*'`. The calling workflow must grant `id-token: write` (the example above does).
-
-Inputs (all optional): `mode` (`pr`|`code`), `target`, `provider` (`ollama`|`bedrock`), `model`, `label`, `max_output_tokens` (2048), `aws_role_arn`, `aws_region` (us-west-2), `num_ctx` (16384), `chunk_chars` (30000), `comment` (true), `agent_ref` (main).
-
-With Bedrock a review takes a minute or two. With Ollama on the standard runner expect roughly 5–10 minutes per chunk for a 7B model; the model download is cached between runs. The workflow uses `pull_request`, never `pull_request_target`, so code from forks runs without write access and gets no PR comment.
-
-Run the same scripts locally (needs Ollama running):
-
-```bash
-python3 path/to/pr-review-agent/ci/collect.py --mode code
-python3 path/to/pr-review-agent/ci/review.py --out .go-pr-review/ci/review.md
-```
+- **Claude Code skill**: `.claude/skills/go-pr-provider`, run as `/go-pr-provider provider=claude|ollama ...` (shell scripts, not this agent).
+- **Agent definition**: `.github/agents/go-pr-check.agent.md`.
