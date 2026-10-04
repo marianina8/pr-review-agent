@@ -232,7 +232,7 @@ def status(rc):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", default=".go-pr-review/ci", help="output folder of collect.py")
-    ap.add_argument("--provider", choices=["ollama", "bedrock"], default="ollama")
+    ap.add_argument("--provider", choices=["ollama", "bedrock", "anthropic"], default="ollama")
     ap.add_argument("--model", default=None,
                     help="default: qwen2.5-coder:7b (ollama) or qwen.qwen3-coder-30b-a3b-v1:0 (bedrock)")
     ap.add_argument("--region", default=os.environ.get("AWS_REGION", "us-west-2"), help="Bedrock region")
@@ -249,15 +249,29 @@ def main():
     ap.add_argument("--out", default="-", help="report path, or - for stdout")
     a = ap.parse_args()
     if not a.model:
-        a.model = "qwen.qwen3-coder-30b-a3b-v1:0" if a.provider == "bedrock" else "qwen2.5-coder:7b"
+        a.model = {"bedrock": "qwen.qwen3-coder-30b-a3b-v1:0", "anthropic": "claude-sonnet-5-5"}.get(
+            a.provider, "qwen2.5-coder:7b")
     ollama = a.provider == "ollama"
     if a.style == "agent" and ollama:
-        sys.exit("ERROR: --style agent is only implemented for --provider bedrock")
+        sys.exit("ERROR: --style agent needs --provider bedrock or anthropic")
 
     def call(system, user, max_tokens, label, est):
         if ollama:
             return chat(a.host, a.model, system, user, a.num_ctx, max_tokens, a.timeout, label=label,
                         est_tokens=est, num_thread=a.num_thread, heartbeat=a.heartbeat)
+        if a.provider == "anthropic":
+            import agent as agent_mod
+            log(f"{label}: sending ~{est} tokens to Anthropic ({a.model})")
+            t = time.time()
+            text, i, o, stop = agent_mod.anthropic_messages(a.model, system, [{"role": "user", "content": [{"text": user}]}],
+                                                            max_tokens, a.timeout)
+            for line in text.splitlines():
+                if line.strip():
+                    print(f"    | {line}", file=sys.stderr, flush=True)
+            r = {"text": text, "prompt_tokens": i, "output_tokens": o, "seconds": round(time.time() - t, 1),
+                 "read_seconds": None, "write_seconds": None}
+            log(f"{label}: done in {r['seconds']:.0f}s ({i} tokens in, {o} out, stop reason {stop})")
+            return r
         return bedrock_chat(a.model, a.region, system, user, max_tokens, a.timeout, label=label,
                             est_tokens=est, heartbeat=a.heartbeat)
 
@@ -268,7 +282,8 @@ def main():
     warnings = list(meta.get("warnings", []))
     stats, findings = [], []
 
-    where = f"num_ctx {a.num_ctx}, {a.num_thread} CPU threads" if ollama else f"Bedrock {a.region}"
+    where = (f"num_ctx {a.num_ctx}, {a.num_thread} CPU threads" if ollama
+             else "Anthropic API" if a.provider == "anthropic" else f"Bedrock {a.region}")
     log(f"{a.provider}: model {a.model}, {where}, "
         f"{len(meta['chunks'])} chunk(s) covering {len(meta['files'])} Go file(s)")
     if meta["chunks"] and ollama:
@@ -289,7 +304,7 @@ def main():
                 log(f"{label}: agent mode, up to {a.max_steps} actions")
                 r = agent_mod.run_agent(a.model, a.region, (d / c["file"]).read_text(), ctx, a.max_steps,
                                         max(a.num_predict, 4096), a.timeout, lambda m: log(f"{label}: {m}"),
-                                        root=a.repo, transcript_path=d / f"agent-{c['file']}")
+                                        root=a.repo, transcript_path=d / f"agent-{c['file']}", provider=a.provider)
                 ag = r["agent"]
                 log(f"{label}: agent done in {r['seconds']:.0f}s: {ag['steps']} actions ({ag['runs']} runs, "
                     f"{ag['writes']} files written), {ag['calls']} model calls, {r['prompt_tokens']} tokens in")
@@ -359,7 +374,7 @@ def main():
 
     total = sum(r["seconds"] for _, r in stats)
     lines += ["", "<details><summary>Run details</summary>", "",
-              f"Provider {a.provider} ({a.style}), model `{a.model}`" + (f", num_ctx {a.num_ctx}" if ollama else f", region {a.region}")
+              f"Provider {a.provider} ({a.style}), model `{a.model}`" + (f", num_ctx {a.num_ctx}" if ollama else "" if a.provider == "anthropic" else f", region {a.region}")
               + f", {len(meta['chunks'])} chunk(s), {total:.0f}s of model time.", "",
               "| call | prompt tokens | output tokens | reading (s) | writing (s) | total (s) |",
               "|---|---|---|---|---|---|"]

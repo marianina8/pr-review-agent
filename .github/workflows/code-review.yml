@@ -28,11 +28,11 @@ on:
         type: string
         default: "."
       provider:
-        description: "ollama (on the runner) or bedrock (Amazon Bedrock)"
+        description: "ollama (on the runner), bedrock (Amazon Bedrock) or anthropic (Anthropic API; needs the ANTHROPIC_API_KEY secret)"
         type: string
         default: ollama
       model:
-        description: "Empty = qwen2.5-coder:7b for ollama, qwen.qwen3-coder-30b-a3b-v1:0 for bedrock"
+        description: "Empty = qwen2.5-coder:7b (ollama), qwen.qwen3-coder-30b-a3b-v1:0 (bedrock), claude-sonnet-5-5 (anthropic)"
         type: string
         default: ""
       aws_role_arn:
@@ -75,6 +75,10 @@ on:
         description: "Branch or tag of pr-review-agent to take the scripts from"
         type: string
         default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Only for provider=anthropic"
+        required: false
 
 jobs:
   review:
@@ -87,7 +91,7 @@ jobs:
     env:
       PROVIDER: ${{ inputs.provider }}
       LABEL: ${{ inputs.label }}
-      MODEL: ${{ inputs.model || (inputs.provider == 'bedrock' && 'qwen.qwen3-coder-30b-a3b-v1:0' || 'qwen2.5-coder:7b') }}
+      MODEL: ${{ inputs.model || (inputs.provider == 'bedrock' && 'qwen.qwen3-coder-30b-a3b-v1:0') || (inputs.provider == 'anthropic' && 'claude-sonnet-5-5') || 'qwen2.5-coder:7b' }}
       OLLAMA_MODELS: /home/runner/.ollama-models
       OUT: .go-pr-review/ci
       PYTHONUNBUFFERED: "1"
@@ -143,6 +147,16 @@ jobs:
           echo "::error::provider=bedrock needs aws_role_arn (set the BEDROCK_REVIEW_ROLE_ARN repository variable; see pr-review-agent README)"
           exit 1
 
+      - name: Check Anthropic settings
+        if: inputs.provider == 'anthropic'
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::provider=anthropic needs the ANTHROPIC_API_KEY secret (gh secret set ANTHROPIC_API_KEY -R OWNER/REPO) passed to this workflow"
+            exit 1
+          fi
+
       - name: Sign in to AWS (OIDC)
         if: inputs.provider == 'bedrock'
         uses: aws-actions/configure-aws-credentials@v6
@@ -166,6 +180,7 @@ jobs:
           NUM_CTX: ${{ inputs.num_ctx }}
           MAX_OUT: ${{ inputs.max_output_tokens }}
           STYLE: ${{ inputs.style }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MAX_STEPS: ${{ inputs.max_steps }}
           AWS_REGION: ${{ inputs.aws_region }}
         run: |

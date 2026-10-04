@@ -90,7 +90,7 @@ class Tools:
             "GOPROXY": "off",
             "GOFLAGS": "-mod=mod",
             "GOTOOLCHAIN": "local",
-            "TMPDIR": tempfile.gettempdir(),
+            "TMPDIR": tempfile.gettempdir(),  # note: no AWS_*, GITHUB_*, ANTHROPIC_* variables
         }
         self.env = {k: v for k, v in self.env.items() if v}
 
@@ -213,8 +213,42 @@ def bedrock_converse(model, region, system, messages, max_tokens, timeout):
     return text, u.get("inputTokens") or 0, u.get("outputTokens") or 0, r.get("stopReason")
 
 
+def anthropic_messages(model, system, messages, max_tokens, timeout):
+    """Anthropic Messages API (ANTHROPIC_API_KEY). Takes the same message shape as bedrock_converse."""
+    import urllib.error
+    import urllib.request
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set (add it as a repository secret)")
+    base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    msgs = [{"role": m["role"], "content": "".join(c.get("text", "") for c in m["content"])} for m in messages]
+    body = {"model": model, "max_tokens": max_tokens, "system": system, "messages": msgs, "temperature": 0.2}
+    for attempt in range(2):
+        req = urllib.request.Request(f"{base}/v1/messages", data=json.dumps(body).encode(), headers={
+            "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                r = json.load(resp)
+            break
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:800]
+            if attempt == 0 and e.code == 400 and "temperature" in detail:
+                body.pop("temperature")  # some models don't accept it; retry without
+                continue
+            raise RuntimeError(f"Anthropic API HTTP {e.code}: {detail}") from None
+    text = "".join(c.get("text", "") for c in r.get("content", []) if c.get("type") == "text").strip()
+    u = r.get("usage", {})
+    return text, u.get("input_tokens") or 0, u.get("output_tokens") or 0, r.get("stop_reason")
+
+
+def converse(provider, model, region, system, messages, max_tokens, timeout):
+    if provider == "anthropic":
+        return anthropic_messages(model, system, messages, max_tokens, timeout)
+    return bedrock_converse(model, region, system, messages, max_tokens, timeout)
+
+
 def run_agent(model, region, chunk_text, context_text, max_steps, max_tokens, timeout, log, root=".",
-              transcript_path=None):
+              transcript_path=None, provider="bedrock"):
     """Returns a result dict shaped like review.chat()/bedrock_chat(), plus agent stats."""
     tools = Tools(root)
     messages = [{"role": "user", "content": [{"text": chunk_text + "\n\n" + context_text}]}]
@@ -229,7 +263,7 @@ def run_agent(model, region, chunk_text, context_text, max_steps, max_tokens, ti
             if last:
                 messages.append({"role": "user", "content": [{"text":
                     "You are out of actions. Reply now with the final action containing the full review."}]})
-            text, i, o, stop = bedrock_converse(model, region, AGENT_PROMPT, messages, max_tokens, timeout)
+            text, i, o, stop = converse(provider, model, region, AGENT_PROMPT, messages, max_tokens, timeout)
             stats["calls"] += 1
             tin, tout = tin + i, tout + o
             messages.append({"role": "assistant", "content": [{"text": text or "(empty reply)"}]})
