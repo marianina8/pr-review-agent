@@ -43,6 +43,14 @@ on:
         description: "bedrock only"
         type: string
         default: us-west-2
+      style:
+        description: "single (one call per chunk) or agent (the model may read files and run go commands first; bedrock only)"
+        type: string
+        default: single
+      max_steps:
+        description: "agent style: max actions per chunk"
+        type: number
+        default: 20
       label:
         description: "Short name for this run (used in the artifact name and PR comment), e.g. sonnet-5-5"
         type: string
@@ -153,15 +161,18 @@ jobs:
           python3 .pr-review-agent/ci/collect.py --mode "$MODE" --target "$TARGET" \
             --base "$BASE" --out "$OUT" --chunk-chars "$CHUNK_CHARS"
 
-      - name: Review (${{ inputs.provider }})
+      - name: Review (${{ inputs.provider }}, ${{ inputs.style }})
         env:
           NUM_CTX: ${{ inputs.num_ctx }}
           MAX_OUT: ${{ inputs.max_output_tokens }}
+          STYLE: ${{ inputs.style }}
+          MAX_STEPS: ${{ inputs.max_steps }}
           AWS_REGION: ${{ inputs.aws_region }}
         run: |
           python3 .pr-review-agent/ci/review.py --dir "$OUT" --provider "$PROVIDER" --model "$MODEL" \
-            --region "$AWS_REGION" --num-ctx "$NUM_CTX" --num-predict "$MAX_OUT" --out "$OUT/review.md"
-          { echo "# ${LABEL:-Code review}: $PROVIDER \`$MODEL\`"; echo; cat "$OUT/review.md"; } >> "$GITHUB_STEP_SUMMARY"
+            --region "$AWS_REGION" --num-ctx "$NUM_CTX" --num-predict "$MAX_OUT" \
+            --style "$STYLE" --max-steps "$MAX_STEPS" --repo . --out "$OUT/review.md"
+          { echo "# ${LABEL:-Code review}: $PROVIDER \`$MODEL\` ($STYLE)"; echo; cat "$OUT/review.md"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment on the pull request
         if: inputs.mode == 'pr' && inputs.comment && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository

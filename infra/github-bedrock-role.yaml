@@ -11,11 +11,11 @@ Parameters:
     Description: GitHub OIDC subjects allowed to assume the role, e.g. repo:OWNER/REPO:* (comma-separated).
   ModelPatterns:
     Type: CommaDelimitedList
-    Default: "qwen.qwen3-coder-*,deepseek.*,anthropic.claude-sonnet-*,anthropic.claude-haiku-*"
+    Default: "qwen.qwen3-coder-*,deepseek.*,anthropic.claude-sonnet-*,anthropic.claude-haiku-*,anthropic.claude-opus-*"
     Description: Foundation-model IDs (wildcards allowed) the role may invoke.
   ProfilePatterns:
     Type: CommaDelimitedList
-    Default: "*.anthropic.claude-sonnet-*,*.anthropic.claude-haiku-*"
+    Default: "*.anthropic.claude-sonnet-*,*.anthropic.claude-haiku-*,*.anthropic.claude-opus-*"
     Description: >
       Inference profiles (us./global.) the role may invoke. Claude on Bedrock is called
       through these profiles, which route to the foundation model in several regions.

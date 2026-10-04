@@ -236,6 +236,10 @@ def main():
     ap.add_argument("--model", default=None,
                     help="default: qwen2.5-coder:7b (ollama) or qwen.qwen3-coder-30b-a3b-v1:0 (bedrock)")
     ap.add_argument("--region", default=os.environ.get("AWS_REGION", "us-west-2"), help="Bedrock region")
+    ap.add_argument("--style", choices=["single", "agent"], default="single",
+                    help="single: one call per chunk; agent: the model may read files and run go commands first")
+    ap.add_argument("--max-steps", type=int, default=20, help="agent style: max actions per chunk")
+    ap.add_argument("--repo", default=".", help="agent style: repository root the agent works in")
     ap.add_argument("--host", default="http://localhost:11434")
     ap.add_argument("--num-ctx", type=int, default=16384)
     ap.add_argument("--num-predict", type=int, default=1024, help="max tokens the model writes per chunk")
@@ -247,6 +251,8 @@ def main():
     if not a.model:
         a.model = "qwen.qwen3-coder-30b-a3b-v1:0" if a.provider == "bedrock" else "qwen2.5-coder:7b"
     ollama = a.provider == "ollama"
+    if a.style == "agent" and ollama:
+        sys.exit("ERROR: --style agent is only implemented for --provider bedrock")
 
     def call(system, user, max_tokens, label, est):
         if ollama:
@@ -276,7 +282,19 @@ def main():
         group(f"{label}: {', '.join(c['files'])}")
         log(f"{label}: packages {', '.join(c['packages'])}; files: {', '.join(c['files'])}")
         try:
-            r = call(FINDINGS_PROMPT, (d / c["file"]).read_text(), a.num_predict, label, est)
+            if a.style == "agent":
+                import agent as agent_mod
+                ctx = (f"go vet: {status(meta.get('vet_rc'))}\n{vet[-3000:]}\n\n"
+                       f"go test: {status(meta.get('test_rc'))}\n{test[-3000:]}")
+                log(f"{label}: agent mode, up to {a.max_steps} actions")
+                r = agent_mod.run_agent(a.model, a.region, (d / c["file"]).read_text(), ctx, a.max_steps,
+                                        max(a.num_predict, 4096), a.timeout, lambda m: log(f"{label}: {m}"),
+                                        root=a.repo, transcript_path=d / f"agent-{c['file']}")
+                ag = r["agent"]
+                log(f"{label}: agent done in {r['seconds']:.0f}s: {ag['steps']} actions ({ag['runs']} runs, "
+                    f"{ag['writes']} files written), {ag['calls']} model calls, {r['prompt_tokens']} tokens in")
+            else:
+                r = call(FINDINGS_PROMPT, (d / c["file"]).read_text(), a.num_predict, label, est)
         except Exception as e:  # keep going so one bad chunk doesn't lose the rest
             warnings.append(f"{c['file']}: model call failed: {e}")
             findings.append((c, f"_Model call failed: {e}_"))
@@ -286,7 +304,7 @@ def main():
         if ollama and r["prompt_tokens"] and r["prompt_tokens"] >= a.num_ctx - 16:
             warnings.append(f"{c['file']}: prompt filled the whole context window "
                             f"({r['prompt_tokens']} tokens); some code was probably not seen")
-        if r.get("output_tokens") and r["output_tokens"] >= a.num_predict:
+        if a.style == "single" and r.get("output_tokens") and r["output_tokens"] >= a.num_predict:
             warnings.append(f"{c['file']}: the review hit the {a.num_predict}-token output limit and was cut off")
         stats.append((c["file"], r))
         findings.append((c, r["text"]))
@@ -341,11 +359,15 @@ def main():
 
     total = sum(r["seconds"] for _, r in stats)
     lines += ["", "<details><summary>Run details</summary>", "",
-              f"Provider {a.provider}, model `{a.model}`" + (f", num_ctx {a.num_ctx}" if ollama else f", region {a.region}")
+              f"Provider {a.provider} ({a.style}), model `{a.model}`" + (f", num_ctx {a.num_ctx}" if ollama else f", region {a.region}")
               + f", {len(meta['chunks'])} chunk(s), {total:.0f}s of model time.", "",
               "| call | prompt tokens | output tokens | reading (s) | writing (s) | total (s) |",
               "|---|---|---|---|---|---|"]
     dash = lambda v: "—" if v is None else v  # noqa: E731  (Bedrock doesn't split reading/writing time)
+    agents = [(n, r["agent"]) for n, r in stats if r.get("agent")]
+    if agents:
+        lines += [""] + [f"Agent {n}: {ag['steps']} actions ({ag['runs']} go commands, {ag['writes']} scratch files), "
+                         f"{ag['calls']} model calls, {ag['bad_replies']} unparseable replies." for n, ag in agents] + [""]
     lines += [f"| {name} | {r['prompt_tokens']} | {r['output_tokens']} | {dash(r.get('read_seconds'))} | "
               f"{dash(r.get('write_seconds'))} | {r['seconds']} |" for name, r in stats]
     lines += ["", "</details>", ""]
